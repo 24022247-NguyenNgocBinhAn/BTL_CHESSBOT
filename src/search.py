@@ -349,7 +349,7 @@ def find_best_move(gamestate: GameState, max_depth: int=  3, time_limit_seconds:
 
     #  Kiểm tra sách khai cuộc (Opening Book)
     try:
-        with polyglot.MemoryMappedReader("C:\\Users\\Lenovo\\Documents\\BTL\\Bot_Chess_btl\\src\\Cerebellum_Light_3Merge_200916\\Cerebellum3Merge.bin") as reader:
+        with polyglot.MemoryMappedReader("src/Cerebellum3Merge.bin") as reader:
             entry = reader.get(gamestate.board)
             if entry is not None:
                 print(f"Book move: {entry.move}")

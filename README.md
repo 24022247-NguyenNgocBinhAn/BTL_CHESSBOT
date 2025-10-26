@@ -53,24 +53,17 @@ Bàn cờ được khởi tạo theo quy tắc chuẩn quốc tế:
 - **Môi trường ảo**: `venv`
 
 ### Các thư viện sử dụng
-- [math](https://docs.python.org/3/library/math.html) → toán học cơ bản  
-- [random](https://docs.python.org/3/library/random.html) → sinh số/ngẫu nhiên  
-- [numpy](https://numpy.org/) → đại số tuyến tính, mảng 2D  
-- [sympy](https://www.sympy.org/) → đại số tượng trưng  
-- [scipy](https://scipy.org/) → tính toán khoa học, tối ưu hóa  
-- [statistics](https://docs.python.org/3/library/statistics.html) → thống kê cơ bản  
-- [itertools](https://docs.python.org/3/library/itertools.html) → tổ hợp, hoán vị  
-
+- [chess](https://docs.python.org/3/library/math.html) → interface cho quy luật đánh cờ
+- 
 Cài đặt các thư viện bằng `pip`:
 ```bash
-pip install numpy sympy scipy
+pip install chess
 ```
 🚀 Chạy chương trình
 Tạo môi trường ảo:
 ```bash
 python -m venv venv
 ```
-
 
 Kích hoạt môi trường:
 Windows:
@@ -91,17 +84,22 @@ Chạy chương trình chính:
 python main.py
 ```
 
-🧩 Cấu trúc dự án (gợi ý)
+🧩 Cấu trúc dự án
 ```bash
 BOT_CHESS_BTL/
 │── README.md              # Tài liệu mô tả dự án
 │── requirements.txt       # Danh sách thư viện cần thiết
-│── main.py                # File chính chạy chương trình
-│── board.py               # Xử lý bàn cờ
-│── pieces.py              # Quy định và xử lý quân cờ
-│── bot.py                 # Logic "chess bot"
-│── utils.py               # Hàm tiện ích (random move, evaluation, ...)
-└── tests/                 # Unit tests
+│── src/                   # Source code     
+    │── init.py    
+    │── constant.py            # Các hằng số hỗ trợ đánh giá giá trị bàn cờ
+    │── board.py               # Xử lý bàn cờ
+    │── evaluation.py          # Đánh gía giá trị bàn cờ
+    │── search.py              # TÌm kiếm nước đi tốt nhất   
+    │── Cerebellum3Merge.rar   # Tệp nén sách khai cuộc
+│── bao_cao.docx           # Bản báo cáo
+│── main.py                # Empty
+│── ui.py                  # UI để dễ thao tác
+└── ...
 ```
 🎯 Mục tiêu
 Biểu diễn bàn cờ vua 8×8 bằng Python.
@@ -115,3 +113,12 @@ Sinh nước đi hợp lệ.
 Lựa chọn nước đi ngẫu nhiên hoặc theo heuristic đơn giản.
 
 Ứng dụng các thư viện toán học để hỗ trợ tính toán & tối ưu hóa.
+
+?  Cách sử dụng
+Unzip Cerebellum3Merge.rar ngay tại src để tránh phải sửa path ở src/search.py
+
+Chạy file ui.py
+
+Lựa chọn Max depth và Time limit cho AI
+
+Bấm Choose side, chọn bên
