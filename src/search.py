@@ -5,42 +5,51 @@ from chess import polyglot
 from .evaluation import evaluate_board
 from .board import GameState
 from .constant import MVV_LVA_SCORES
-
+import copy
 # ==============================================================================
-# Tập hợp các biến toàn cục phục vụ cho quá trình tìm kiếm nước đi tối ưu
-# trong engine cờ vua theo thuật toán Negamax + Alpha-Beta pruning nâng cao.
+# DATA STRUCTURES AND ADVANCED CONSTANTS
 # ==============================================================================
 
-position_count = 0                 # Đếm số lượng vị trí đã được duyệt trong tìm kiếm
-MAX_DEPTH = 64                     # Giới hạn độ sâu tối đa (phòng tránh tràn ngăn xếp)
-MATE_VALUE = 100000                # Giá trị ước lượng cho thế chiếu hết (mate score)
+position_count = 0
+MAX_DEPTH = 64
+MATE_VALUE = 100000
 
-# 🧠 Cờ trong bảng băm (Transposition Table Flags)
+# Time management
+search_start_time = 0
+search_time_limit = 0
+
+# Transposition Table Flags
 TT_EXACT, TT_LOWERBOUND, TT_UPPERBOUND = 0, 1, 2
-# TT_EXACT: giá trị chính xác (tốt nhất trong khoảng alpha-beta)
-# TT_LOWERBOUND: giá trị là giới hạn dưới (score >= value)
-# TT_UPPERBOUND: giá trị là giới hạn trên (score <= value)
 
-# 🗡️ Killer Moves: Lưu 2 nước “giết” mạnh nhất trong mỗi độ sâu
-# (được dùng lại trong quá trình sắp xếp nước đi để tăng tốc độ cắt tỉa)
+# Killer Moves and History Heuristic
 killer_moves = [[None, None] for _ in range(MAX_DEPTH)]
-
-# 🧩 History Heuristic:
-# Bộ nhớ thống kê độ hiệu quả của từng nước đi trong quá khứ (theo chiều đi và màu quân)
-# Dạng mảng [color][from_square][to_square]
 history_heuristic = [[[0] * 64 for _ in range(64)] for _ in range(2)]
 
-# 🌳 Hằng số cho Null Move Pruning (bỏ qua 1 lượt để kiểm tra cắt tỉa nhanh)
+# Pruning constants
 NULL_MOVE_REDUCTION = 2
 
 
-# ==============================================================================
-# 🔹 HÀM HỖ TRỢ CƠ BẢN
-# ==============================================================================
+class TimeoutException(Exception):
+    """Raised when search time limit is exceeded"""
+    pass
+
+
+def check_time():
+    global search_start_time, search_time_limit
+    if search_time_limit <= 0:
+        return
+    elapsed = time.time() - search_start_time
+    remaining = search_time_limit - elapsed
+    # Kiểm tra thường xuyên hơn khi sắp hết giờ
+    if remaining < 0:
+        raise TimeoutException()
+    elif remaining < 0.1 and position_count % 256 == 0:
+        raise TimeoutException()
+    elif position_count % 1024 == 0 and elapsed > search_time_limit * 0.9:
+        raise TimeoutException()
 
 def has_non_pawn_material(board: chess.Board) -> bool:
-    """Kiểm tra xem bên đang đi có quân nào khác ngoài Tốt không.
-    Dùng để quyết định có thể áp dụng Null Move Pruning (vì endgame thường ít hiệu quả)."""
+    """Return True if side to move has non-pawn material."""
     for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
         if len(board.pieces(pt, board.turn)) > 0:
             return True
@@ -48,103 +57,77 @@ def has_non_pawn_material(board: chess.Board) -> bool:
 
 
 def is_mate_score(score: float) -> bool:
-    """Xác định xem điểm đánh giá có tương ứng với thế chiếu hết (Mate) hay không."""
+    """Check if a score represents a mate."""
     return abs(score) > MATE_VALUE - 1000
 
 
-# ==============================================================================
-# 🔸 LỚP VÀ BẢNG BĂM (TRANSPOSITION TABLE)
-# ==============================================================================
-
 class TTEntry:
-    """Một phần tử trong Transposition Table (Bảng băm lưu kết quả đã tính)."""
-    __slots__ = ('depth', 'score', 'flag', 'best_move')
+    _slots_ = ('depth', 'score', 'flag', 'best_move')
 
     def __init__(self, depth, score, flag, best_move):
-        self.depth = depth        # Độ sâu khi lưu
-        self.score = score        # Giá trị đánh giá của vị trí
-        self.flag = flag          # Kiểu giá trị (EXACT / LOWERBOUND / UPPERBOUND)
-        self.best_move = best_move  # Nước đi tốt nhất tìm được tại node đó
+        self.depth, self.score, self.flag, self.best_move = depth, score, flag, best_move
 
 
-# Bảng băm toàn cục dùng để lưu kết quả tìm kiếm đã xử lý
 transposition_table = {}
 
 
 # ==============================================================================
-# 🔹 SẮP XẾP NƯỚC ĐI (Move Ordering)
+# MOVE ORDERING
 # ==============================================================================
 
 def score_move(board: chess.Board, move: chess.Move, depth: int, tt_move: chess.Move = None) -> int:
-    """Đánh giá mức độ ưu tiên của nước đi để sắp xếp thứ tự duyệt.
-    Các tiêu chí ưu tiên:
-    1️ Nước từ Transposition Table (TT move)
-    2️ Nước phong cấp
-    3️ Nước ăn quân (MVV-LVA: Most Valuable Victim - Least Valuable Attacker)
-    4️ Killer move
-    5️ History heuristic (hiệu quả lịch sử)
-    """
-    # Ưu tiên 1: TT move
+    """Assign score to move: TT > Captures > Promotions > Killers > History."""
     if tt_move and move == tt_move:
         return 10_000_000
-
-    # Ưu tiên 2: Nước phong cấp (promotion)
     if move.promotion:
         return 9_500_000 + move.promotion
-
-    # Ưu tiên 3: Ăn quân (capture)
     if board.is_capture(move):
         victim = board.piece_at(move.to_square)
         attacker = board.piece_at(move.from_square)
         if victim and attacker:
             return 9_000_000 + MVV_LVA_SCORES[attacker.piece_type][victim.piece_type]
-        return 9_000_000  # Ăn chéo (en passant)
-    else:
-        # Ưu tiên 4: Killer moves
-        if killer_moves[depth][0] == move:
-            return 8_000_000
-        if killer_moves[depth][1] == move:
-            return 7_900_000
-
-    # Ưu tiên 5: History heuristic
+        return 9_000_000  # En-passant
+    else:  # Quiet moves
+        if depth < MAX_DEPTH:
+            if killer_moves[depth][0] == move:
+                return 8_000_000
+            if killer_moves[depth][1] == move:
+                return 7_900_000
     return history_heuristic[board.turn][move.from_square][move.to_square]
 
 
-def order_moves(board: chess.Board, moves: list[chess.Move], depth: int, tt_move: chess.Move = None) -> list[chess.Move]:
-    """Sắp xếp danh sách nước đi theo điểm ưu tiên để tối ưu hóa việc cắt tỉa."""
+def order_moves(board: chess.Board, moves: list[chess.Move], depth: int, tt_move: chess.Move = None) -> list[
+    chess.Move]:
     return sorted(moves, key=lambda m: score_move(board, m, depth, tt_move), reverse=True)
 
 
-
 # ==============================================================================
-# Giúp tránh "hiệu ứng cắt sai" (horizon effect) khi vị trí chưa ổn định (ví dụ có thể ăn lại).
-# Thuật toán chỉ mở rộng thêm các nước ăn/quân hoặc phong cấp để ổn định vị trí.
+# SEARCH ALGORITHMS
 # ==============================================================================
 
 def quiescence_search(gamestate: GameState, alpha: float, beta: float, max_qdepth=32, qdepth=0) -> float:
     global position_count
     position_count += 1
 
-    # Giới hạn độ sâu yên tĩnh
+    # Check time less frequently in qsearch for performance (every 2048 nodes)
+    if position_count % 2048 == 0:
+        check_time()
+
     if qdepth > max_qdepth:
         return evaluate_board(gamestate.board)
 
-    # Đánh giá ban đầu (stand pat)
     stand_pat = evaluate_board(gamestate.board)
     if stand_pat >= beta:
         return beta
     alpha = max(alpha, stand_pat)
 
-    # Lấy các nước capture + promotion để mở rộng
     capture_moves = list(gamestate.board.generate_legal_captures())
     for move in gamestate.board.generate_legal_moves():
         if move.promotion and not gamestate.board.is_capture(move):
             capture_moves.append(move)
 
-    # Sắp xếp các nước ăn
     capture_moves = order_moves(gamestate.board, capture_moves, qdepth)
 
-    # Duyệt từng nước capture
     for move in capture_moves:
         gamestate.make_move(move)
         score = -quiescence_search(gamestate, -beta, -alpha, max_qdepth, qdepth + 1)
@@ -157,38 +140,28 @@ def quiescence_search(gamestate: GameState, alpha: float, beta: float, max_qdept
     return alpha
 
 
-# ==============================================================================
-# 🔹 NEGAMAX TÌM KIẾM (với Alpha-Beta + TT + Killers + History + Null Move)
-# ==============================================================================
-# Đây là lõi của công cụ tìm kiếm nước đi. Negamax là biến thể của Minimax:
-#     score = -negamax(child, -beta, -alpha)
-# Engine sử dụng kỹ thuật tối ưu:
-#   - Alpha-Beta Pruning (cắt tỉa nhánh không cần thiết)
-#   - Null Move Pruning
-#   - Killer Move / History Heuristic
-#   - Transposition Table caching
-# ==============================================================================
-
 def negamax(gamestate: GameState, depth: int, alpha: float, beta: float, ply: int, do_null: bool = True) -> float:
     global position_count, killer_moves, history_heuristic
 
-    # Kiểm tra điều kiện kết thúc ván cờ
+    # Check time less frequently for performance (every 2048 nodes)
+    if position_count % 2048 == 0:
+        check_time()
+
+    # Terminal conditions
     if gamestate.board.is_game_over():
         if gamestate.board.is_checkmate():
             return -MATE_VALUE + ply
         return 0
 
-    # Khi đạt độ sâu 0 thì chuyển sang quiescence search
     if depth <= 0:
         return quiescence_search(gamestate, alpha, beta)
 
     position_count += 1
 
-    # Hòa do lặp lại hoặc luật 50 nước
+    # Draw detection
     if ply > 0 and (gamestate.board.is_repetition() or gamestate.board.is_fifty_moves()):
         return 0
 
-    # Giới hạn phòng tràn
     if ply >= MAX_DEPTH:
         return evaluate_board(gamestate.board)
 
@@ -197,32 +170,32 @@ def negamax(gamestate: GameState, depth: int, alpha: float, beta: float, ply: in
     tt_entry = transposition_table.get(zobrist_key)
     tt_move = None
 
-    # Kiểm tra bảng băm (Transposition Table)
+    # Retrieve from TT with mate score adjustment
     if tt_entry and tt_entry.depth >= depth:
         tt_score = tt_entry.score
 
-        # Hiệu chỉnh điểm Mate theo độ sâu (để tránh sai lệch)
         if is_mate_score(tt_score):
             if tt_score > 0:
                 tt_score -= ply
             else:
                 tt_score += ply
 
-        # Áp dụng theo loại flag
         if tt_entry.flag == TT_EXACT:
             return tt_score
         elif tt_entry.flag == TT_LOWERBOUND:
             alpha = max(alpha, tt_score)
         elif tt_entry.flag == TT_UPPERBOUND:
             beta = min(beta, tt_score)
-
         if alpha >= beta:
             return tt_score
         tt_move = tt_entry.best_move
 
-    # 🌀 Null Move Pruning: bỏ qua lượt đi để kiểm tra xem có thể cắt tỉa hay không
-    if (do_null and depth >= 3 and not gamestate.board.is_check() and
-        has_non_pawn_material(gamestate.board) and not is_mate_score(beta)):
+    # Null Move Pruning
+    if (do_null and
+            depth >= 3 and
+            not gamestate.board.is_check() and
+            has_non_pawn_material(gamestate.board) and
+            not is_mate_score(beta)):
 
         gamestate.board.push(chess.Move.null())
         score = -negamax(gamestate, depth - 1 - NULL_MOVE_REDUCTION, -beta, -beta + 1, ply + 1, False)
@@ -231,37 +204,31 @@ def negamax(gamestate: GameState, depth: int, alpha: float, beta: float, ply: in
         if score >= beta:
             return beta
 
-    # Khởi tạo giá trị tốt nhất
     best_score = float('-inf')
     best_move = None
-
-    # Sắp xếp nước đi
     ordered_moves = order_moves(gamestate.board, list(gamestate.get_legal_moves()), depth, tt_move)
 
-    # Duyệt từng nước đi
     for move in ordered_moves:
         gamestate.make_move(move)
         score = -negamax(gamestate, depth - 1, -beta, -alpha, ply + 1)
         gamestate.unmake_move()
 
-        # Cập nhật nếu tốt hơn
         if score > best_score:
             best_score = score
             best_move = move
 
         alpha = max(alpha, score)
 
-        # 💥 Cắt tỉa beta
         if alpha >= beta:
+            # Update killer moves and history for quiet moves
             if not gamestate.board.is_capture(move) and depth < MAX_DEPTH:
-                # Cập nhật Killer Move + History Heuristic
                 if killer_moves[depth][0] != move:
                     killer_moves[depth][1] = killer_moves[depth][0]
                     killer_moves[depth][0] = move
                 history_heuristic[gamestate.board.turn][move.from_square][move.to_square] += depth * depth
             break
 
-    # Chuẩn bị lưu vào bảng băm
+    # Store in TT with mate score adjustment
     score_to_store = best_score
     if is_mate_score(best_score):
         if best_score > 0:
@@ -269,47 +236,33 @@ def negamax(gamestate: GameState, depth: int, alpha: float, beta: float, ply: in
         else:
             score_to_store -= ply
 
-    # Chọn flag tương ứng
     flag = TT_EXACT
     if best_score <= original_alpha:
         flag = TT_UPPERBOUND
     elif best_score >= beta:
         flag = TT_LOWERBOUND
-
-    # 🧱 Lưu vào Transposition Table
-    transposition_table[zobrist_key] = TTEntry(depth, best_score, flag, best_move)
+    transposition_table[zobrist_key] = TTEntry(depth, score_to_store, flag, best_move)
 
     return best_score
 
 
-# ==============================================================================
-# 🔹 HÀM GỐC (Root Search) — tìm nước tốt nhất ở mức cao nhất
-# ==============================================================================
-
-def search_root(gamestate: GameState, depth: int, pv_move: chess.Move = None) -> tuple[chess.Move, float]:
-    """Tìm nước đi tốt nhất tại root với độ sâu cụ thể (có hỗ trợ PV move ưu tiên)."""
+def search_root(gamestate, depth, pv_move=None):
     alpha, beta = float('-inf'), float('inf')
-
     legal_moves = list(gamestate.get_legal_moves())
     if not legal_moves:
         return None, evaluate_board(gamestate.board)
 
-    # Ưu tiên PV move (nếu có) bằng cách đưa lên đầu danh sách
-    if pv_move and pv_move in legal_moves:
-        legal_moves.insert(0, legal_moves.pop(legal_moves.index(pv_move)))
-
-    start_index = 1 if pv_move and pv_move in legal_moves else 0
-    sorted_part = order_moves(gamestate.board, legal_moves[start_index:], depth)
-    legal_moves = legal_moves[:start_index] + sorted_part
-
-    best_move = legal_moves[0]
+    best_move = None
     best_score = float('-inf')
 
-    # Duyệt từng nước ở root
     for move in legal_moves:
-        gamestate.make_move(move)
-        score = -negamax(gamestate, depth - 1, -beta, -alpha, 1)
-        gamestate.unmake_move()
+        try:
+            gamestate.make_move(move)
+            score = -negamax(gamestate, depth - 1, -beta, -alpha, 1)
+            gamestate.unmake_move()
+        except TimeoutException:
+            gamestate.unmake_move()
+            raise  # propagate to upper level
 
         if score > best_score:
             best_score = score
@@ -318,80 +271,122 @@ def search_root(gamestate: GameState, depth: int, pv_move: chess.Move = None) ->
 
     return best_move, best_score
 
-
-# ==============================================================================
-# 🔹 LÃO HÓA HISTORY HEURISTIC (Ageing)
-# ==============================================================================
-# Khi giá trị History tăng quá cao, ta chia đôi để tránh tràn hoặc sai lệch.
-# ==============================================================================
-
 def age_history_heuristic():
-    """Giảm bớt giá trị History Heuristic khi nó quá lớn để tránh tràn số."""
+    """Prevent history scores from overflowing."""
     global history_heuristic
     max_value = max(max(max(row) for row in color_table) for color_table in history_heuristic)
     if max_value > 10000:
         history_heuristic = [[[val // 2 for val in row] for row in color_table] for color_table in history_heuristic]
 
 
-# ==============================================================================
-# 🔹 TÌM NƯỚC ĐI TỐT NHẤT (Iterative Deepening)
-# ==============================================================================
-# Đây là điểm khởi đầu chính của engine khi tìm nước đi.
-# Gồm các giai đoạn:
-#   1️⃣ Tra sách mở (Opening Book)
-#   2️⃣ Khởi tạo lại các bảng heuristic
-#   3️⃣ Lặp sâu dần (Iterative Deepening) để cải thiện kết quả
-#   4️⃣ In thông tin tìm kiếm theo chuẩn UCI
-# ==============================================================================
-
-def find_best_move(gamestate: GameState, max_depth: int=  3, time_limit_seconds: int = None) -> chess.Move:
+def find_best_move(gamestate: GameState, max_depth: int, time_limit_seconds: float = None) -> chess.Move:
+    """
+    Phiên bản an toàn với board: tránh bug 'AI returned illegal move'
+    và giữ nguyên cấu trúc gốc của bạn.
+    """
     global position_count, killer_moves, history_heuristic, transposition_table
+    global search_start_time, search_time_limit
 
-    #  Kiểm tra sách khai cuộc (Opening Book)
+    # 1️⃣ Opening book
     try:
-        with polyglot.MemoryMappedReader("src/Cerebellum3Merge.bin") as reader:
+        with polyglot.MemoryMappedReader(
+            r"Cerebellum_Light_3Merge_200916\Cerebellum3Merge.bin"
+        ) as reader:
             entry = reader.get(gamestate.board)
-            if entry is not None:
+            if entry is not None and gamestate.board.is_legal(entry.move):
                 print(f"Book move: {entry.move}")
                 return entry.move
     except FileNotFoundError:
         pass
 
-    #  Reset lại bộ nhớ tìm kiếm
+    # 2️⃣ Initialize search
     position_count = 0
     killer_moves = [[None, None] for _ in range(MAX_DEPTH)]
     history_heuristic = [[[0] * 64 for _ in range(64)] for _ in range(2)]
     transposition_table.clear()
 
+    # 3️⃣ Time management setup
+    search_start_time = time.time()
+    if time_limit_seconds:
+        search_time_limit = time_limit_seconds * 2.0  # extra for depth 1
+    else:
+        search_time_limit = 0.0
+
     best_move_overall = None
-    start_time = time.time()
+    last_completed_depth = 0
 
-    # ♻️ Tìm kiếm sâu dần (Iterative Deepening)
+    # 4️⃣ Iterative Deepening
     for depth in range(1, max_depth + 1):
-        move, score = search_root(gamestate, depth, best_move_overall)
+        try:
+            # Sau độ sâu 1 -> trở về giới hạn bình thường
+            if depth == 2 and time_limit_seconds:
+                search_time_limit = time_limit_seconds * 0.95
 
-        if move:
-            best_move_overall = move
+            # ⚠️ Dùng bản copy của gamestate để tránh phá board gốc
+            temp_state = copy.deepcopy(gamestate)
 
-        elapsed_ms = (time.time() - start_time) * 1000
-        nps = int(position_count / (elapsed_ms / 1000)) if elapsed_ms > 0 else 0
+            move, score = search_root(temp_state, depth, best_move_overall)
 
-        # In thông tin theo chuẩn UCI
-        score_info = "mate" if score in (float('inf'), float('-inf')) else f"cp {int(score)}"
-        print(f"info depth {depth} score {score_info} time {int(elapsed_ms)} nodes {position_count} nps {nps} pv {move.uci() if move else 'none'}")
+            if move and gamestate.board.is_legal(move):
+                best_move_overall = move
+                last_completed_depth = depth
 
-        # Giảm giá trị history sau mỗi 5 tầng để tránh tràn
-        if depth % 5 == 0:
-            age_history_heuristic()
+            elapsed_ms = (time.time() - search_start_time) * 1000
+            nps = int(position_count / (elapsed_ms / 1000)) if elapsed_ms > 0 else 0
 
-        # ⏱️ Giới hạn thời gian tìm kiếm
-        if time_limit_seconds and elapsed_ms / 1000 > time_limit_seconds:
-            print("Time limit reached!")
+            # UCI-formatted score
+            if is_mate_score(score):
+                mate_in = (MATE_VALUE - abs(score) + 1) // 2
+                mate_in = -mate_in if score < 0 else mate_in
+                score_info = f"mate {mate_in}"
+            else:
+                score_info = f"cp {int(score)}"
+
+            print(
+                f"info depth {depth} score {score_info} time {int(elapsed_ms)} "
+                f"nodes {position_count} nps {nps} pv {move.uci() if move else 'none'}"
+            )
+
+            if depth % 5 == 0:
+                age_history_heuristic()
+
+            if is_mate_score(score) and abs(score) > MATE_VALUE - 100:
+                print(f"Mate found at depth {depth}")
+                break
+
+            # Thông minh dừng sớm nếu depth tiếp theo quá lâu
+            if time_limit_seconds and depth > 1:
+                elapsed = time.time() - search_start_time
+                estimated_next = elapsed * 3
+                if elapsed + estimated_next > time_limit_seconds:
+                    print(f"Time management: stopping before depth {depth + 1}")
+                    break
+
+        except TimeoutException:
+            elapsed_ms = (time.time() - search_start_time) * 1000
+            print(f"⚠️ Timeout at depth {depth} after {int(elapsed_ms)}ms")
+            print(f"⚠️ Completed depth: {last_completed_depth}")
+            if best_move_overall is None:
+                print("⚠️ Emergency: selecting first legal move")
+                legal_moves = list(gamestate.get_legal_moves())
+                if legal_moves:
+                    best_move_overall = legal_moves[0]
             break
 
-        # Nếu phát hiện thế chiếu hết bắt buộc (forced mate)
-        if is_mate_score(score) and abs(score) > MATE_VALUE - 100:
-            print(f"Mate found at depth {depth}")
+        except Exception as e:
+            print(f"❌ Exception during search depth {depth}: {e}")
             break
 
+    # 5️⃣ Fallback nếu chưa có move hợp lệ
+    if not best_move_overall or not gamestate.board.is_legal(best_move_overall):
+        print("⚠️ Fallback: picking first legal move from board")
+        legal_moves = list(gamestate.board.legal_moves)
+        if legal_moves:
+            best_move_overall = legal_moves[0]
+            print(f"✅ Fallback move used: {best_move_overall.uci()}")
+        else:
+            print("❌ No legal moves (checkmate or stalemate).")
+            best_move_overall = None
+
+    print(f"✅ Best move: {best_move_overall.uci() if best_move_overall else 'none'} (depth {last_completed_depth})")
     return best_move_overall

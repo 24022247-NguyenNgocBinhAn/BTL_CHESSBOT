@@ -440,7 +440,6 @@ class ChessGUI(tk.Frame):
         self.ai_status_var.set('AI: thinking...')
         self._on_ai_param_change()
 
-        # Capture a snapshot for the AI to work on (cheap copy)
         board_snapshot = self.board.copy()
 
         def _worker(snapshot, depth, time_limit, out_q):
@@ -456,10 +455,16 @@ class ChessGUI(tk.Frame):
         t.start()
         self.ai_thread = t
 
+        # --- FAILSAFE TIMEOUT WATCHDOG ---
+        if self.ai_time_limit:
+            def _timeout_watch():
+                if self.ai_thinking and self.ai_thread and self.ai_thread.is_alive():
+                    print("[AI] Time limit reached — stopping AI.")
+                    self.ai_thinking = False
+                    self.ai_status_var.set("AI: timeout")
+            self.master.after(int((self.ai_time_limit + 1) * 1000), _timeout_watch)
+
     def _poll_ai_queue(self):
-        """Called periodically from mainloop to handle AI results.
-        This avoids blocking the UI and keeps thread-handling simple.
-        """
         try:
             while True:
                 typ, payload = self.ai_queue.get_nowait()
@@ -468,7 +473,6 @@ class ChessGUI(tk.Frame):
                     if mv is None:
                         print('AI returned no move')
                     else:
-                        # ensure it's a chess.Move (convert from str if required)
                         try:
                             if not isinstance(mv, chess.Move):
                                 mv = chess.Move.from_uci(str(mv))
@@ -476,23 +480,31 @@ class ChessGUI(tk.Frame):
                             print('AI returned invalid move:', mv)
                             mv = None
 
-                        if mv is not None and any(m == mv for m in self.board.legal_moves):
+                        if mv is not None and mv in self.board.legal_moves:
                             self.board.push(mv)
                             self._append_san(mv)
                             self.draw_board(full=False)
                             if self.board.is_game_over():
                                 self.on_game_over()
                         else:
-                            print('AI returned move not legal in current position:', mv)
+                            print('AI returned illegal move:', mv)
                 elif typ == 'error':
                     print('AI error:', payload)
-                # mark AI as idle
+
+                # reset status after each message
                 self.ai_thinking = False
                 self.ai_status_var.set('AI: ready' if self.ai_available else 'AI: unavailable')
+
         except queue.Empty:
             pass
-        finally:
-            self.master.after(80, self._poll_ai_queue)
+
+        # --- AUTO RECOVER IF THREAD HANGS ---
+        if self.ai_thinking and self.ai_thread and not self.ai_thread.is_alive():
+            print("[AI] Thread ended unexpectedly or timeout expired. Resetting state.")
+            self.ai_thinking = False
+            self.ai_status_var.set('AI: ready')
+
+        self.master.after(80, self._poll_ai_queue)
 
     # --- move list / UI helpers (fast incremental SAN appends) ---
     def _append_san(self, last_move: chess.Move):
